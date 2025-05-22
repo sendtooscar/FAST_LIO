@@ -1,3 +1,10 @@
+## Steps to run for MUNFRL dataset
+
+1. Download a bag from dataset : https://mun-frl-vil-dataset.readthedocs.io/en/latest/  (light house and querry datasets work with FASTLIO)
+2. Clone this repository to a ros workspace and follow build instructions below
+3. roslaunch fast_lio mapping_velodyne.launch (config files up to date for MUN FRL)
+4. play ROS bag
+
 ## Related Works and Extended Application
 
 **SLAM:**

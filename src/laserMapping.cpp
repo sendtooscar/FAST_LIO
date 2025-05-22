@@ -59,9 +59,14 @@
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <tf2/LinearMath/Quaternion.h>
+
+#include <fstream>
 
 #define INIT_TIME           (0.1)
-#define LASER_POINT_COV     (0.001)
+#define LASER_POINT_COV     (0.001) //#define LASER_POINT_COV     (0.001) , i.e srt(cov)=0.03 m = pm 9cm (95% CI)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
 
@@ -86,6 +91,7 @@ string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+double map_align_yaw_deg = 0.0, map_align_roll_deg = 0.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -94,6 +100,11 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+
+//rmse eval variables
+bool isWriteEnable = true;
+int fastlioPosCounter = 0;
+std::ofstream outfileFLIO("/storage_ssd/catkin_scaloam_ws/FASTLIO_Odom_LH.txt", std::ios_base::trunc);
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -538,7 +549,7 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
     sensor_msgs::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = "lio_body";
     pubLaserCloudFull_body.publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -565,7 +576,8 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
     laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudMap.header.frame_id = "camera_init";
-    pubLaserCloudMap.publish(laserCloudMap);
+    pubLaserCloudMap.publish(laserCloudMap); //rav
+    //std::cout<<"HERE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"<<std::endl;
 }
 
 template<typename T>
@@ -584,7 +596,7 @@ void set_posestamp(T & out)
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.child_frame_id = "lio_body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped.publish(odomAftMapped);
@@ -611,7 +623,8 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "lio_body" ) );
+    
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -623,10 +636,64 @@ void publish_path(const ros::Publisher pubPath)
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
     jjj++;
-    if (jjj % 10 == 0) 
+    if (jjj % 1 == 0) 
     {
         path.poses.push_back(msg_body_pose);
         pubPath.publish(path);
+
+	 static tf2_ros::StaticTransformBroadcaster static_broadcaster;
+  	 geometry_msgs::TransformStamped static_transformStamped;
+
+	  static_transformStamped.header.stamp = ros::Time::now();
+	  static_transformStamped.header.frame_id = "worldGPSact";
+	  static_transformStamped.child_frame_id = "camera_init";
+	  static_transformStamped.transform.translation.x = 0.0;
+	  static_transformStamped.transform.translation.y = 0.0;
+	  static_transformStamped.transform.translation.z = 0.0;
+	  tf2::Quaternion quat;
+	  quat.setRPY(map_align_roll_deg/180.0*M_PI, 0.0, map_align_yaw_deg/180.0*M_PI);
+	  static_transformStamped.transform.rotation.x = quat.x();
+	  static_transformStamped.transform.rotation.y = quat.y();
+	  static_transformStamped.transform.rotation.z = quat.z();
+	  static_transformStamped.transform.rotation.w = quat.w();
+	  static_broadcaster.sendTransform(static_transformStamped);
+		
+	  // R---------------------------------------------------------------------------- R//
+	  //write path txt file 
+        if(isWriteEnable)
+        {
+            std::cout <<  "path position.x : " << msg_body_pose.pose.position.x << std::endl;
+            //write file - fastLIO
+            Eigen::Quaterniond odomQ;
+            odomQ.w() = msg_body_pose.pose.orientation.w;
+            odomQ.x() = msg_body_pose.pose.orientation.x;
+            odomQ.y() = msg_body_pose.pose.orientation.y;
+            odomQ.z() = msg_body_pose.pose.orientation.z;
+            Eigen::Matrix3d odomR = odomQ.normalized().toRotationMatrix();
+
+            std::ofstream foutE("/storage_ssd/catkin_scaloam_ws/FASTLIO_Odom_LH.txt", std::ios::app); 
+            fastlioPosCounter++;
+            foutE.setf(std::ios::fixed, std::ios::floatfield);
+            foutE.precision(0);
+            foutE << fastlioPosCounter << " ";
+            foutE.precision(9);
+            foutE << msg_body_pose.header.stamp  << " "
+                   << odomR(0,0) << " "
+                   << odomR(0,1) << " "
+                   << odomR(0,2) << " "
+                    << msg_body_pose.pose.position.x  << " "
+                    << odomR(1,0) << " "
+                    << odomR(1,1) << " "
+                    << odomR(1,2) << " "
+                    << msg_body_pose.pose.position.y  << " "
+                    << odomR(2,0) << " "
+                    << odomR(2,1) << " "
+                    << odomR(2,2) << " "
+                    << msg_body_pose.pose.position.z  << std::endl;
+
+        }
+	  // R---------------------------------------------------------------------------- R//
+
     }
 }
 
@@ -759,6 +826,8 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
+    nh.param<double>("map_align_yaw_deg",map_align_yaw_deg,5.0);
+    nh.param<double>("map_align_roll_deg",map_align_roll_deg,180.0);
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
@@ -825,11 +894,12 @@ int main(int argc, char** argv)
     string pos_log_dir = root_dir + "/Log/pos_log.txt";
     fp = fopen(pos_log_dir.c_str(),"w");
 
-    ofstream fout_pre, fout_out, fout_dbg;
+    ofstream fout_pre, fout_out, fout_dbg, fout_cov;
     fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
     fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
+    fout_cov.open(DEBUG_FILE_DIR("mat_cov.txt"),ios::out);
     fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-    if (fout_pre && fout_out)
+    if (fout_pre && fout_out && fout_cov)
         cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
     else
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
@@ -839,6 +909,7 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
@@ -916,7 +987,7 @@ int main(int argc, char** argv)
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+            cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
@@ -932,7 +1003,7 @@ int main(int argc, char** argv)
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
-            if(0) // If you need to see map point, change to "if(1)"
+            if(1) // If you need to see map point, change to "if(1)"
             {
                 PointVector ().swap(ikdtree.PCL_Storage);
                 ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
@@ -973,8 +1044,8 @@ int main(int argc, char** argv)
             if (path_en)                         publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
-            // publish_effect_world(pubLaserCloudEffect);
-            // publish_map(pubLaserCloudMap);
+            publish_effect_world(pubLaserCloudEffect);
+            publish_map(pubLaserCloudMap);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1004,6 +1075,13 @@ int main(int argc, char** argv)
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
+
+
+			//dump the covariance
+               auto P = kf.get_P();
+			printf("[ cov ]: %f",P(0,0));
+               //fout_cov << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << P(0,0) << endl;
+			fout_cov << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << P(0,0) << " " << P(1,1) << " " << P(2,2) << " " << P(3,3) << " " << P(4,4) << " " << P(5,5) << " " << P(6,6) << " " << P(7,7) << " " << P(8,8) << " " << P(9,9) << " " << P(10,10) << " " << P(11,11) << " " << P(12,12) << " " << P(13,13) << " " << P(14,14) << " " << P(15,15) << " " << P(16,16) << " " << P(17,17) << " " << P(18,18) << " " << P(19,19) << " " << P(20,20) << " " << P(21,21) << " " << P(22,22) <<endl;
             }
         }
 
@@ -1025,6 +1103,7 @@ int main(int argc, char** argv)
 
     fout_out.close();
     fout_pre.close();
+    fout_cov.close();
 
     if (runtime_pos_log)
     {
